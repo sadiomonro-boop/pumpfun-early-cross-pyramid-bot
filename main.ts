@@ -16,6 +16,10 @@
 //     flattens everything past -15%, so one bad stretch cannot sink the run.
 //   * Fully deterministic: no clocks, no unseeded randomness, stable sorted
 //     ordering everywhere, so the two harness executions agree byte for byte.
+//   * Defensive by design (critic round 1): the hello/batch dispatch is
+//     wrapped in try/catch and always answers a batch, every u64 from the
+//     harness is parsed through a validating helper, and in-flight buy value
+//     is reserved against cash until its fill resolves.
 //
 // Protocol: NDJSON over stdin/stdout. The harness sends a hello message,
 // then batch messages (each with a seq and a slot), then done. We answer
@@ -65,9 +69,10 @@ type PriceSample = { slot: number; price: number };
 
 interface MintState {
   mint: string;
-  createdSlot: number;
+  createdSlot: number; // 0 = no CreateEvent seen yet for this mint
   completed: boolean;
   crossedSlot: number; // first slot where real reserves reached the entry bar
+  seenBelowBar: boolean; // ever observed with real reserves below the bar
   samples: PriceSample[];
   lastPrice: number;
   lastRealSol: number;
@@ -104,6 +109,15 @@ const pendingMints = new Map<string, number>();
 // (the position still looks open), wasting the per-batch order budget on
 // sells that are then rejected for insufficient tokens.
 const pendingSells = new Set<string>();
+// Pyramid adds sent but not yet resolved, per mint. An add counts toward
+// the cap only once its fill lands, so in-flight adds are tracked here
+// instead of on the position (critic S4).
+const pendingAdds = new Map<string, number>();
+// Buy quote amounts committed by orders sent but not yet resolved, keyed by
+// client_id. Fills land 2 slots after the decision, so consecutive batches
+// would otherwise size against the same undebited cash (critic S5).
+const committedBuys = new Map<string, { amount: bigint; slot: number }>();
+let committedLamports = 0n;
 
 let capitalLamports = 10_000_000_000n;
 let cashLamports = 10_000_000_000n;
@@ -121,14 +135,30 @@ function priceFromReserves(virtualSol: string, virtualToken: string): number {
   return sol / tok;
 }
 
+// Parse a u64 decimal string from the harness into a BigInt, or null when
+// the value is missing or malformed. A bare BigInt(...) throws on bad input
+// (and BigInt(NaN) throws too), so every conversion of harness data goes
+// through here — an uncaught throw mid-run would kill the process with no
+// reply for the pending batch (critic M1).
+function parseLamports(value: unknown): bigint | null {
+  if (typeof value !== "string") return null;
+  if (!/^(0|[1-9][0-9]{0,19})$/.test(value)) return null;
+  try {
+    return BigInt(value);
+  } catch {
+    return null;
+  }
+}
+
 function getMint(mint: string): MintState {
   let state = mints.get(mint);
   if (state === undefined) {
     state = {
       mint,
-      createdSlot: currentSlot,
+      createdSlot: 0, // 0 = no CreateEvent seen yet; first sight is not a birth
       completed: false,
       crossedSlot: 0,
+      seenBelowBar: false,
       samples: [],
       lastPrice: 0,
       lastRealSol: 0,
@@ -150,8 +180,18 @@ function notePrice(state: MintState, slot: number, price: number): void {
 }
 
 function updateRealSol(state: MintState, realSol: number, slot: number): void {
+  // A missing real_*_reserves field parses to NaN; never store it, or the
+  // next sizeBuy would throw on BigInt(NaN) (critic M1).
+  if (!Number.isFinite(realSol) || realSol < 0) realSol = 0;
   state.lastRealSol = realSol;
-  if (state.crossedSlot === 0 && realSol >= ENTRY_MIN_REAL_SOL) {
+  if (realSol < ENTRY_MIN_REAL_SOL) {
+    state.seenBelowBar = true;
+    return;
+  }
+  // Arm the cross only for a mint we watched climb through the bar from
+  // below. A mint first seen already above the bar was created before the
+  // window opened: its ~100-slot edge window is long gone (critic S1).
+  if (state.crossedSlot === 0 && state.seenBelowBar) {
     state.crossedSlot = slot;
   }
 }
@@ -192,6 +232,27 @@ function makeBuyOrder(mint: string, quoteLamports: bigint): Order {
   };
 }
 
+// Send a buy while reserving its value against cash until the fill resolves
+// (critic S5): fills land 2 slots after the decision, so consecutive
+// batches would otherwise size against the same undebited cash.
+function sendBuy(mint: string, quoteLamports: bigint): Order {
+  const order = makeBuyOrder(mint, quoteLamports);
+  committedBuys.set(order.client_id, { amount: quoteLamports, slot: currentSlot });
+  committedLamports += quoteLamports;
+  return order;
+}
+
+// Release one buy's reservation when its fill resolves (filled, rejected or
+// failed). Safe to call for an unknown id: it simply does nothing.
+function clearCommitted(clientId: string): void {
+  const entry = committedBuys.get(clientId);
+  if (entry !== undefined) {
+    committedLamports -= entry.amount;
+    if (committedLamports < 0n) committedLamports = 0n;
+    committedBuys.delete(clientId);
+  }
+}
+
 function makeSellOrder(mint: string, tokenAmount: bigint): Order {
   return {
     side: "sell",
@@ -207,6 +268,9 @@ function makeSellOrder(mint: string, tokenAmount: bigint): Order {
 // lastRealSol is in SOL, so convert it to lamports before applying the
 // basis-point cap (a floor on the SOL value would zero the cap).
 function sizeBuy(state: MintState, fractionOfCash: number): bigint {
+  // A non-finite reserve (NaN from a missing field) would throw in BigInt;
+  // treat it as no liquidity at all (critic M1).
+  if (!Number.isFinite(state.lastRealSol) || state.lastRealSol <= 0) return 0n;
   const reserveLamports = BigInt(
     Math.floor(state.lastRealSol * LAMPORTS_PER_SOL_NUM),
   );
@@ -215,7 +279,10 @@ function sizeBuy(state: MintState, fractionOfCash: number): bigint {
   const safeReserveCap = (reserveCap * 9n) / 10n; // stay 10% under the cap
   let size = BigInt(Math.floor(MAX_BUY_SOL * LAMPORTS_PER_SOL_NUM));
   if (safeReserveCap < size) size = safeReserveCap;
-  const cashCap = (cashLamports * BigInt(Math.floor(fractionOfCash * 100))) / 100n;
+  // Size against cash not yet debited by in-flight buys (critic S5).
+  const spendableCash = cashLamports - committedLamports;
+  const cashBase = spendableCash > 0n ? spendableCash : 0n;
+  const cashCap = (cashBase * BigInt(Math.floor(fractionOfCash * 100))) / 100n;
   if (cashCap < size) size = cashCap;
   return size;
 }
@@ -223,19 +290,33 @@ function sizeBuy(state: MintState, fractionOfCash: number): bigint {
 function handleHello(msg: Record<string, unknown>): void {
   const capital = msg.capital as { lamports: string } | undefined;
   if (capital !== undefined) {
-    capitalLamports = BigInt(capital.lamports);
-    cashLamports = capitalLamports;
-    peakEquityLamports = capitalLamports;
+    const lamports = parseLamports(capital.lamports);
+    if (lamports !== null) {
+      capitalLamports = lamports;
+      cashLamports = capitalLamports;
+      peakEquityLamports = capitalLamports;
+    }
   }
   const caps = msg.caps as Record<string, unknown> | undefined;
   if (caps !== undefined) {
-    if (typeof caps.max_open_positions === "number") {
+    // Only accept finite integers: BigInt() later throws on NaN or a
+    // fractional cap value (critic M1).
+    if (
+      typeof caps.max_open_positions === "number" &&
+      Number.isInteger(caps.max_open_positions)
+    ) {
       maxOpenPositions = caps.max_open_positions;
     }
-    if (typeof caps.max_order_bps_of_real_reserve === "number") {
+    if (
+      typeof caps.max_order_bps_of_real_reserve === "number" &&
+      Number.isInteger(caps.max_order_bps_of_real_reserve)
+    ) {
       maxOrderBpsOfRealReserve = caps.max_order_bps_of_real_reserve;
     }
-    if (typeof caps.max_orders_per_batch === "number") {
+    if (
+      typeof caps.max_orders_per_batch === "number" &&
+      Number.isInteger(caps.max_orders_per_batch)
+    ) {
       maxOrdersPerBatch = caps.max_orders_per_batch;
     }
   }
@@ -244,7 +325,11 @@ function handleHello(msg: Record<string, unknown>): void {
 function handleBatch(msg: Record<string, unknown>): Order[] {
   const seq = msg.seq as number;
   void seq;
-  currentSlot = msg.slot as number;
+  // A malformed slot must not poison every later comparison; keep the last
+  // good slot instead (critic M1).
+  if (typeof msg.slot === "number" && Number.isFinite(msg.slot)) {
+    currentSlot = msg.slot;
+  }
   const orders: Order[] = [];
 
   const events = (msg.events as Record<string, unknown>[]) ?? [];
@@ -254,6 +339,8 @@ function handleBatch(msg: Record<string, unknown>): Order[] {
       const state = getMint(event.mint as string);
       state.createdSlot = event.slot as number;
       state.lastRealSol = 0;
+      // Creation is itself an observation below the bar (critic S1).
+      state.seenBelowBar = true;
       const price = priceFromReserves(
         event.virtual_sol_reserves as string,
         event.virtual_token_reserves as string,
@@ -296,23 +383,40 @@ function handleBatch(msg: Record<string, unknown>): Order[] {
   // from the account snapshot, which is the ground truth.
   const fills = (msg.fills as Record<string, unknown>[]) ?? [];
   for (const fill of fills) {
-    // A rejected or failed order frees its pending slot immediately: without
-    // this a rejected exit leaves its mint in pendingSells forever and the
-    // position can never be sold again.
-    if (fill.status !== "filled") {
-      if (fill.side === "sell") pendingSells.delete(fill.mint as string);
-      if (fill.side === "buy") pendingMints.delete(fill.mint as string);
-      continue;
-    }
     const mint = fill.mint as string;
     const side = fill.side as string;
-    const quote = BigInt(fill.quote_lamports as string);
-    const fee = BigInt(fill.fee_lamports as string);
-    const txFee = BigInt(fill.tx_fee_lamports as string);
-    const tokens = BigInt(fill.token_amount as string);
+    const clientId = fill.client_id as string;
+    // Release the cash reservation for any resolved buy, whatever its
+    // outcome (critic S5).
+    if (side === "buy") clearCommitted(clientId);
+    // A rejected or failed order frees its pending slot immediately: without
+    // this a rejected exit leaves its mint in pendingSells forever and the
+    // position can never be sold again. A rejected pyramid add frees its
+    // add slot too (critic S4).
+    if (fill.status !== "filled") {
+      if (side === "sell") pendingSells.delete(mint);
+      if (side === "buy") {
+        pendingMints.delete(mint);
+        if (positions.has(mint)) {
+          const inFlight = pendingAdds.get(mint) ?? 0;
+          if (inFlight > 0) pendingAdds.set(mint, inFlight - 1);
+        }
+      }
+      continue;
+    }
+    const quote = parseLamports(fill.quote_lamports);
+    const fee = parseLamports(fill.fee_lamports);
+    const txFee = parseLamports(fill.tx_fee_lamports);
+    const tokens = parseLamports(fill.token_amount);
+    // A fill we cannot parse is unusable; skip it rather than throwing
+    // (critic M1). Its pending slots were already freed above.
+    if (quote === null || fee === null || txFee === null || tokens === null) {
+      continue;
+    }
     if (side === "buy") {
       pendingMints.delete(mint);
-      let pos = positions.get(mint);
+      const existing = positions.get(mint);
+      let pos = existing;
       if (pos === undefined) {
         pos = {
           mint,
@@ -322,20 +426,29 @@ function handleBatch(msg: Record<string, unknown>): Order[] {
           adds: 0,
         };
         positions.set(mint, pos);
+      } else {
+        // A buy landing on an already-held position is a pyramid add: it
+        // counts toward the cap only now that it filled (critic S4).
+        const inFlight = pendingAdds.get(mint) ?? 0;
+        if (inFlight > 0) {
+          pendingAdds.set(mint, inFlight - 1);
+          pos.adds += 1;
+        }
       }
       pos.tokens += tokens;
       pos.costLamports += quote + fee + txFee;
     } else {
+      // Any filled sell clears the pending flag, even a partial one, so the
+      // remainder can be re-sent next batch if the exit still triggers
+      // (critic S3).
+      pendingSells.delete(mint);
       const pos = positions.get(mint);
       if (pos !== undefined && pos.tokens > 0n) {
         const sold = tokens > pos.tokens ? pos.tokens : tokens;
         const costOut = (pos.costLamports * sold) / pos.tokens;
         pos.tokens -= sold;
         pos.costLamports -= costOut;
-        if (pos.tokens === 0n) {
-          positions.delete(mint);
-          pendingSells.delete(mint);
-        }
+        if (pos.tokens === 0n) positions.delete(mint);
       }
     }
   }
@@ -344,20 +457,30 @@ function handleBatch(msg: Record<string, unknown>): Order[] {
     | { cash_lamports: string; positions: { mint: string; token_amount: string; cost_lamports: string }[] }
     | undefined;
   if (account !== undefined) {
-    cashLamports = BigInt(account.cash_lamports);
+    const cash = parseLamports(account.cash_lamports);
+    if (cash !== null) cashLamports = cash;
     const seen = new Set<string>();
     for (const acctPos of account.positions) {
+      const acctTokens = parseLamports(acctPos.token_amount);
+      const acctCost = parseLamports(acctPos.cost_lamports);
+      // An unparseable position row is left exactly as our map holds it
+      // (and still counts as seen, so it is not deleted); throwing here
+      // would kill the run (critic M1).
+      if (acctTokens === null || acctCost === null) {
+        seen.add(acctPos.mint);
+        continue;
+      }
       seen.add(acctPos.mint);
       const existing = positions.get(acctPos.mint);
       if (existing !== undefined) {
-        existing.tokens = BigInt(acctPos.token_amount);
-        existing.costLamports = BigInt(acctPos.cost_lamports);
+        existing.tokens = acctTokens;
+        existing.costLamports = acctCost;
         if (existing.tokens === 0n) positions.delete(acctPos.mint);
       } else {
         positions.set(acctPos.mint, {
           mint: acctPos.mint,
-          tokens: BigInt(acctPos.token_amount),
-          costLamports: BigInt(acctPos.cost_lamports),
+          tokens: acctTokens,
+          costLamports: acctCost,
           entrySlot: currentSlot,
           adds: 0,
         });
@@ -374,6 +497,16 @@ function handleBatch(msg: Record<string, unknown>): Order[] {
     }
     for (const [key, sentSlot] of [...pendingMints]) {
       if (currentSlot - sentSlot > 200) pendingMints.delete(key);
+    }
+    // Safety net for the cash reservations: drop any entry whose fill was
+    // never reported (the harness reports every resolution, so this should
+    // never trigger) rather than leaking committed cash forever.
+    for (const [clientId, entry] of [...committedBuys]) {
+      if (currentSlot - entry.slot > 500) {
+        committedLamports -= entry.amount;
+        if (committedLamports < 0n) committedLamports = 0n;
+        committedBuys.delete(clientId);
+      }
     }
   }
 
@@ -414,12 +547,20 @@ function handleBatch(msg: Record<string, unknown>): Order[] {
     } else if (gain <= STOP_LOSS) {
       sellAll = true;
       reason = "stop-loss";
-      stoppedOutAt.set(key, currentSlot);
     } else if (currentSlot - pos.entrySlot > TIME_STOP_SLOTS) {
       sellAll = true;
       reason = "time-stop";
     }
     void reason;
+    if (sellAll) {
+      // Disarm the mint on ANY full exit, not just a stop-loss: a coin sold
+      // at +10% inside its cross window would otherwise be re-bought at
+      // once while still inside the window (critic S2). Re-entry needs a
+      // genuinely fresh cross from below the bar, after the cooldown.
+      stoppedOutAt.set(key, currentSlot);
+      state.crossedSlot = 0;
+      state.seenBelowBar = false;
+    }
     if (sellAll && pos.tokens > 0n && !pendingSells.has(key)) {
       pendingSells.add(key);
       orders.push(makeSellOrder(key, pos.tokens));
@@ -432,13 +573,15 @@ function handleBatch(msg: Record<string, unknown>): Order[] {
   if (!haltEntries && !flattenAll && slotsFree > 0 && orders.length < maxOrdersPerBatch) {
     // Pyramids on winning positions first: add while the blended gain is
     // at least 5%. Each add is sized by the mint's (now larger) real
-    // reserves, so proven runners get more capital than flat coins.
+    // reserves, so proven runners get more capital than flat coins. An add
+    // counts toward the cap only when its fill lands (critic S4), so
+    // in-flight adds are counted here too.
     for (const key of positionKeys) {
       if (orders.length >= maxOrdersPerBatch) break;
       const pos = positions.get(key);
       const state = mints.get(key);
       if (pos === undefined || state === undefined) continue;
-      if (pos.adds >= PYRAMID_MAX_ADDS) continue;
+      if (pos.adds + (pendingAdds.get(key) ?? 0) >= PYRAMID_MAX_ADDS) continue;
       if (pendingSells.has(key)) continue;
       const entry = avgEntryPrice(pos);
       if (entry <= 0 || state.lastPrice <= 0) continue;
@@ -446,8 +589,8 @@ function handleBatch(msg: Record<string, unknown>): Order[] {
       if (gain < PYRAMID_MIN_GAIN) continue;
       const size = sizeBuy(state, 0.1);
       if (size < BigInt(Math.floor(MIN_BUY_SOL * LAMPORTS_PER_SOL_NUM))) continue;
-      pos.adds += 1;
-      orders.push(makeBuyOrder(key, size));
+      pendingAdds.set(key, (pendingAdds.get(key) ?? 0) + 1);
+      orders.push(sendBuy(key, size));
     }
 
     // Fresh crossers first, deterministic order: buy a mint within ~120
@@ -468,7 +611,10 @@ function handleBatch(msg: Record<string, unknown>): Order[] {
         if (state.completed) continue;
         if (state.samples.length < 5) continue;
         if (state.lastPrice <= 0) continue;
-        if (currentSlot - state.createdSlot < ENTRY_MIN_AGE_SLOTS) continue;
+        // The age gate applies only when the birth was actually observed
+        // (createdSlot 0 means no CreateEvent seen; first sight is not a
+        // birth — critic S1).
+        if (state.createdSlot !== 0 && currentSlot - state.createdSlot < ENTRY_MIN_AGE_SLOTS) continue;
         const cooled = stoppedOutAt.get(key);
         if (cooled !== undefined && currentSlot - cooled < REENTRY_COOLDOWN_SLOTS) {
           continue;
@@ -489,7 +635,7 @@ function handleBatch(msg: Record<string, unknown>): Order[] {
         const size = sizeBuy(state, 0.1);
         if (size < BigInt(Math.floor(MIN_BUY_SOL * LAMPORTS_PER_SOL_NUM))) continue;
         pendingMints.set(candidates[i].mint, currentSlot);
-        orders.push(makeBuyOrder(candidates[i].mint, size));
+        orders.push(sendBuy(candidates[i].mint, size));
       }
     }
   }
@@ -514,18 +660,32 @@ process.stdin.on("data", (chunk: string) => {
         continue;
       }
       const type = msg.type as string;
-      if (type === "hello") {
-        handleHello(msg);
-      } else if (type === "batch") {
-        const orders = handleBatch(msg);
-        const reply = JSON.stringify({
-          type: "reply",
-          seq: msg.seq,
-          orders,
-        });
-        process.stdout.write(reply + "\n");
-      } else if (type === "done") {
-        process.exit(0);
+      try {
+        if (type === "hello") {
+          handleHello(msg);
+        } else if (type === "batch") {
+          const orders = handleBatch(msg);
+          const reply = JSON.stringify({
+            type: "reply",
+            seq: msg.seq,
+            orders,
+          });
+          process.stdout.write(reply + "\n");
+        } else if (type === "done") {
+          process.exit(0);
+        }
+      } catch {
+        // Never die mid-run: an exception in handleHello/handleBatch would
+        // otherwise kill the process with no reply for the pending batch
+        // and leave the entry unranked (critic M1). Answer with no orders
+        // and keep going; the next batch re-syncs from the account snapshot.
+        if (type === "batch") {
+          const seq =
+            typeof msg.seq === "number" && Number.isFinite(msg.seq) ? msg.seq : 0;
+          process.stdout.write(
+            JSON.stringify({ type: "reply", seq, orders: [] }) + "\n",
+          );
+        }
       }
     }
     newline = buffer.indexOf("\n");
